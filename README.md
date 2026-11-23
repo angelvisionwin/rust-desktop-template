@@ -170,7 +170,7 @@ src/
 ├─ main.rs              Punto de entrada del ejecutable
 ├─ lib.rs               Raíz de la biblioteca y declaración de módulos
 ├─ cli.rs               Argumentos, ayuda y versión
-├─ app.rs               Ventana, bandeja, menú, temporizadores y notificaciones
+├─ app.rs               Orquestación y estado de la aplicación (`App`)
 ├─ meta.rs              Identidad de la aplicación (clases, mutex, rutas, versión)
 ├─ panel.rs             Panel dibujado con GDI (tema claro/oscuro, barras e iconos)
 ├─ settings.rs          Diálogo de configuración (idioma, umbral, intervalo, dispositivos)

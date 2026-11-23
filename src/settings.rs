@@ -95,7 +95,7 @@ pub fn focus() {
 }
 
 /// Abre el diálogo y devuelve la configuración guardada, si la hay.
-pub unsafe fn open(parent: HWND) -> Option<Config> {
+pub unsafe fn open(parent: HWND, current: Config) -> Option<Config> {
     if is_open() {
         focus();
         return None;
@@ -396,7 +396,6 @@ pub unsafe fn open(parent: HWND) -> Option<Config> {
         return None;
     };
 
-    let current = crate::app::config();
     let mut result: Option<Config> = None;
     let state = Box::into_raw(Box::new(State {
         parent,

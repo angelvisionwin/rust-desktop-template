@@ -1,5 +1,7 @@
 # Indicaciones para el orquestador (estado tras Fase 3)
 
+> **Documento histórico.** Estado vigente: `orquestador-fase-4.md`.
+
 Documento operativo para el agente/orquestador que continúe la transformación de
 Batería en `rust-desktop-template`. Sustituye a `orquestador-fase-2.md`.
 
