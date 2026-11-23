@@ -9,6 +9,8 @@ use windows::Win32::System::Registry::{
 };
 use windows::core::PCWSTR;
 
+use crate::meta;
+
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -24,9 +26,9 @@ pub fn log(msg: &str) {
     let Some(base) = std::env::var_os("LOCALAPPDATA") else {
         return;
     };
-    let dir: PathBuf = PathBuf::from(base).join("Bateria");
+    let dir: PathBuf = PathBuf::from(base).join(meta::DATA_DIR_NAME);
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("bateria.log");
+    let path = dir.join(meta::log_file());
     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 512 * 1024 {
         let _ = std::fs::remove_file(&path);
     }
@@ -77,11 +79,9 @@ pub fn is_dark_mode() -> bool {
     rc == ERROR_SUCCESS && data == 0
 }
 
-const RUN_VALUE: &str = "BateriaTray";
-
 pub fn autostart_enabled() -> bool {
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    let value = wide(RUN_VALUE);
+    let value = wide(meta::RUN_VALUE);
     let rc = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -100,7 +100,7 @@ pub fn set_autostart(enabled: bool) -> bool {
     let Some(key) = open_run_key(KEY_READ | KEY_SET_VALUE) else {
         return false;
     };
-    let value = wide(RUN_VALUE);
+    let value = wide(meta::RUN_VALUE);
     let ok = if enabled {
         let Ok(exe) = std::env::current_exe() else {
             unsafe {

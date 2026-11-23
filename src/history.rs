@@ -122,7 +122,7 @@ impl History {
 }
 
 pub fn path() -> PathBuf {
-    crate::config::dir().join("history.tsv")
+    crate::config::dir().join(crate::meta::HISTORY_FILE)
 }
 
 pub fn unix_now() -> u64 {

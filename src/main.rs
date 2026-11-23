@@ -6,6 +6,7 @@ mod config;
 mod history;
 mod i18n;
 mod icon;
+mod meta;
 mod panel;
 mod settings;
 mod util;
@@ -42,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterDeviceNotificationW, UnregisterDeviceNotification,
 };
 use windows::core::GUID;
-use windows::core::{PCWSTR, w};
+use windows::core::PCWSTR;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_REFRESHED: u32 = WM_APP + 2;
@@ -125,16 +126,17 @@ fn history() -> &'static Mutex<History> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
-        print_line(&format!("bateria {}", env!("CARGO_PKG_VERSION")));
+        print_line(&format!("{} {}", meta::BIN_NAME, meta::VERSION));
         return;
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print_line(
-            "Uso: bateria [--show] [--dump] [--version]\n  \
+        print_line(&format!(
+            "Uso: {} [--show] [--dump] [--version]\n  \
              --show     abre el panel al arrancar\n  \
              --dump     imprime el estado en JSON y termina\n  \
              --version  muestra la versión",
-        );
+            meta::BIN_NAME
+        ));
         return;
     }
 
@@ -154,7 +156,7 @@ fn main() {
         SHOW_ON_FIRST.store(args.iter().any(|arg| arg == "--show"), Ordering::SeqCst);
         util::log(&format!(
             "inicio v{} — idioma {} — refresco {}s — umbral {}%",
-            env!("CARGO_PKG_VERSION"),
+            meta::VERSION,
             i18n::current(),
             config().refresh_interval_secs(),
             config().threshold()
@@ -170,7 +172,7 @@ fn main() {
 
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
 
-        let main_class = w!("BateriaTrayWnd");
+        let main_class = meta::WINDOW_CLASS_MAIN;
         let main_wc = WNDCLASSW {
             lpfnWndProc: Some(main_wndproc),
             hInstance: instance,
@@ -183,7 +185,7 @@ fn main() {
             return;
         }
 
-        let panel_class = w!("BateriaPanelWnd");
+        let panel_class = meta::WINDOW_CLASS_PANEL;
         let panel_wc = WNDCLASSW {
             style: CS_DROPSHADOW,
             lpfnWndProc: Some(panel_wndproc),
@@ -305,7 +307,7 @@ unsafe fn register_device_notifications(hwnd: HWND) {
 }
 
 unsafe fn single_instance() -> bool {
-    match CreateMutexW(None, BOOL(1), w!("Local\\BateriaTrayMutex")) {
+    match CreateMutexW(None, BOOL(1), meta::MUTEX_NAME) {
         // El handle permanece abierto hasta que termina el proceso.
         Ok(_handle) => GetLastError() != ERROR_ALREADY_EXISTS,
         Err(_) => false,

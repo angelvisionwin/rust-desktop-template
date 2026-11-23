@@ -168,6 +168,7 @@ No se envía nada a la red y no se recopilan datos personales.
 ```
 src/
 ├─ main.rs              Ventana, bandeja, menú, temporizadores, CLI y notificaciones
+├─ meta.rs              Identidad de la aplicación (clases, mutex, rutas, versión)
 ├─ panel.rs             Panel dibujado con GDI (tema claro/oscuro, barras e iconos)
 ├─ settings.rs          Diálogo de configuración (idioma, umbral, intervalo, dispositivos)
 ├─ icon.rs              Icono de batería generado en tiempo de ejecución
@@ -183,6 +184,11 @@ src/
    ├─ ble.rs            Batería por GATT (Bluetooth LE)
    └─ xinput.rs         Mandos XInput
 ```
+
+El nombre visible del producto está en `identity.rs` (raíz): lo comparten el
+código y `build.rs`, que no depende del crate para no duplicar datos. El resto de
+la identidad (nombre del paquete, versión, descripción y licencia) se toma de
+`Cargo.toml`.
 
 ## Desarrollo
 

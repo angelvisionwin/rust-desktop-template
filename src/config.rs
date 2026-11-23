@@ -1,10 +1,11 @@
-//! Configuración persistente en `%LOCALAPPDATA%\Bateria\config.toml`.
+//! Configuración persistente en el directorio de datos de la aplicación.
 
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
 use crate::i18n::Lang;
+use crate::meta;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
@@ -84,7 +85,7 @@ impl Config {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "# Configuración de Batería\n\
+            "# Configuración de {app}\n\
              # Idioma: auto | es | ca | en | fr | de\n\
              language = \"{language}\"\n\
              \n\
@@ -105,6 +106,7 @@ impl Config {
             threshold = self.low_battery_threshold,
             refresh = self.refresh_seconds,
             show = self.show_time_remaining,
+            app = meta::APP_NAME,
         )
     }
 
@@ -147,11 +149,11 @@ pub fn dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("Bateria")
+    base.join(meta::DATA_DIR_NAME)
 }
 
 pub fn path() -> PathBuf {
-    dir().join("config.toml")
+    dir().join(meta::CONFIG_FILE)
 }
 
 #[cfg(test)]

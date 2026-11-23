@@ -29,6 +29,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::config::Config;
 use crate::i18n::{self, Lang};
+use crate::meta;
 use crate::util;
 
 const ID_LANGUAGE: i32 = 101;
@@ -100,7 +101,7 @@ pub unsafe fn open(parent: HWND) -> Option<Config> {
     }
 
     let instance = HINSTANCE(GetModuleHandleW(None).ok()?.0);
-    let class = w!("BateriaSettingsWnd");
+    let class = meta::WINDOW_CLASS_SETTINGS;
     let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
 
     let mut registered = REGISTERED.lock().unwrap();
