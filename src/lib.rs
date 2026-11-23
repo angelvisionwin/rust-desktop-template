@@ -1,21 +1,18 @@
-//! Biblioteca de Batería: identidad, plataforma, interfaz y orquestación.
+//! Plantilla de aplicación de escritorio Win32.
 //!
 //! El ejecutable solo llama a [`run`]; todo lo demás es interno.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub(crate) mod app;
-pub(crate) mod battery;
 pub(crate) mod cli;
 pub(crate) mod config;
-pub(crate) mod history;
-pub(crate) mod i18n;
-pub(crate) mod icon;
 pub(crate) mod meta;
 pub(crate) mod panel;
 pub(crate) mod platform;
 pub(crate) mod settings;
-pub(crate) mod util;
+pub(crate) mod strings;
+pub(crate) mod tray;
 
 /// Ejecuta la aplicación.
 pub fn run() {

@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN: bateria.exe
+  BIN: tray-app.exe
 
 jobs:
   audit:
@@ -57,11 +57,22 @@ jobs:
           if (-not (Test-Path $exe)) { throw "no se generó $exe" }
           $size = (Get-Item $exe).Length
           Write-Host ("tamaño: {0:N0} bytes" -f $size)
-          if ($size -lt 50000) { throw "el binario parece incompleto" }
+          # Umbral inferior: solo detecta binarios truncados o vacíos.
+          # Referencia local: 499 712 bytes en release; no es un límite máximo.
+          if ($size -lt 250000) { throw "el binario parece incompleto" }
+
           $info = (Get-Item $exe).VersionInfo
           Write-Host "descripcion: $($info.FileDescription)"
           Write-Host "producto: $($info.ProductName)"
-          & $exe --version
+          if (-not $info.FileDescription) { throw "falta FileDescription" }
+          if (-not $info.ProductName) { throw "falta ProductName" }
+          if ($info.OriginalFilename -ne $env:BIN) {
+            throw "OriginalFilename no coincide: $($info.OriginalFilename)"
+          }
+
+          $version = (& $exe --version | Out-String).Trim()
+          Write-Host "version: $version"
+          if (-not $version.StartsWith("tray-app ")) { throw "salida de --version inesperada" }
       - name: Sumas de verificación
         shell: pwsh
         run: |
@@ -70,9 +81,9 @@ jobs:
           Get-Content target/release/SHA256SUMS.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: bateria-windows-x64
+          name: tray-app-windows-x64
           path: |
-            target/release/bateria.exe
+            target/release/tray-app.exe
             target/release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
@@ -99,6 +110,6 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
-            target/release/bateria.exe
+            target/release/tray-app.exe
             target/release/SHA256SUMS.txt
           generate_release_notes: true

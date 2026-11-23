@@ -7,47 +7,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use crate::battery::{self, ChargeState, DeviceBattery, refresh_all};
 use crate::config::Config;
-use crate::history::{self, History};
-use crate::{cli, i18n, icon, meta, panel, platform, settings, util};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use crate::meta;
+use crate::panel::{self, PanelView, RowView};
+use crate::platform::{self, time};
+use crate::{cli, settings, strings, tray};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
-use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFY_ICON_DATA_FLAGS, NOTIFYICONDATAW, Shell_NotifyIconW,
-};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::UI::WindowsAndMessaging::{
-    DEV_BROADCAST_DEVICEINTERFACE_W, DEVICE_NOTIFY_WINDOW_HANDLE, HDEVNOTIFY,
-    RegisterDeviceNotificationW, UnregisterDeviceNotification,
-};
-use windows::core::GUID;
-use windows::core::PCWSTR;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_REFRESHED: u32 = WM_APP + 2;
-const TRAY_ID: u32 = 1;
 const TIMER_REFRESH: usize = 1;
-const TIMER_NOTIFICATIONS: usize = 2;
-const TIMER_DEVICES: usize = 3;
 const ID_PANEL: usize = 1;
 const ID_REFRESH: usize = 2;
-const ID_AUTOSTART: usize = 3;
-const ID_CONFIG: usize = 4;
-const ID_EXIT: usize = 5;
-
-const DBT_DEVNODES_CHANGED: u32 = 0x0007;
-const DBT_DEVICEARRIVAL: u32 = 0x8000;
-const DBT_DEVICEREMOVECOMPLETE: u32 = 0x8004;
-
-const MIN_REFRESH_GAP_MS: u128 = 3000;
-
-const GUID_DEVINTERFACE_HID: GUID = GUID::from_u128(0x4d1e55b2_f16f_11cf_88cb_001111000030);
-const GUID_DEVINTERFACE_BLUETOOTH: GUID = GUID::from_u128(0x0850302a_b344_4fda_9be9_90576b8d46f0);
-const DBT_DEVTYP_DEVICEINTERFACE: u32 = 5;
+const ID_TEST_NOTIFICATION: usize = 3;
+const ID_AUTOSTART: usize = 4;
+const ID_CONFIG: usize = 5;
+const ID_EXIT: usize = 6;
 
 /// Estado de la aplicación.
 ///
@@ -58,27 +37,20 @@ const DBT_DEVTYP_DEVICEINTERFACE: u32 = 5;
 /// referencia `&mut App` viva.
 struct App {
     config: RefCell<Config>,
-    history: RefCell<History>,
+    view: RefCell<PanelView>,
 
-    devices: RefCell<Vec<DeviceBattery>>,
-    updated: Cell<Option<(u16, u16)>>,
+    refresh_tx: mpsc::Sender<Vec<RowView>>,
+    refresh_rx: mpsc::Receiver<Vec<RowView>>,
+    busy: Arc<AtomicBool>,
+    pending_refresh: Cell<bool>,
+    show_on_first: Cell<bool>,
 
-    tray_icon: Cell<isize>,
-    tray_retired: Cell<isize>,
-    tray_state: Cell<Option<(Option<u8>, bool)>>,
     notified: RefCell<HashSet<String>>,
+    notify_seq: Cell<u64>,
 
     panel: Cell<Option<HWND>>,
     hidden_at: Cell<Option<Instant>>,
-
-    refresh_tx: mpsc::Sender<Vec<DeviceBattery>>,
-    refresh_rx: mpsc::Receiver<Vec<DeviceBattery>>,
-    busy: Arc<AtomicBool>,
-    pending_from_device: Cell<bool>,
-    last_refresh: Cell<Option<Instant>>,
-    show_on_first: Cell<bool>,
-
-    device_notifications: RefCell<Vec<isize>>,
+    tray_icon: Cell<isize>,
 }
 
 impl App {
@@ -86,22 +58,26 @@ impl App {
         let (refresh_tx, refresh_rx) = mpsc::channel();
         App {
             config: RefCell::new(Config::load()),
-            history: RefCell::new(History::load()),
-            devices: RefCell::new(Vec::new()),
-            updated: Cell::new(None),
-            tray_icon: Cell::new(0),
-            tray_retired: Cell::new(0),
-            tray_state: Cell::new(None),
-            notified: RefCell::new(HashSet::new()),
-            panel: Cell::new(None),
-            hidden_at: Cell::new(None),
+            view: RefCell::new(PanelView {
+                title: meta::APP_NAME.to_string(),
+                subtitle: None,
+                footer: strings::FOOTER.to_string(),
+                empty: (
+                    strings::EMPTY_TITLE.to_string(),
+                    strings::EMPTY_HINT.to_string(),
+                ),
+                rows: Vec::new(),
+            }),
             refresh_tx,
             refresh_rx,
             busy: Arc::new(AtomicBool::new(false)),
-            pending_from_device: Cell::new(false),
-            last_refresh: Cell::new(None),
+            pending_refresh: Cell::new(false),
             show_on_first: Cell::new(false),
-            device_notifications: RefCell::new(Vec::new()),
+            notified: RefCell::new(HashSet::new()),
+            notify_seq: Cell::new(0),
+            panel: Cell::new(None),
+            hidden_at: Cell::new(None),
+            tray_icon: Cell::new(0),
         }
     }
 
@@ -109,21 +85,44 @@ impl App {
         self.config.borrow().clone()
     }
 
-    fn devices_snapshot(&self) -> Vec<DeviceBattery> {
-        self.devices.borrow().clone()
+    /// Texto del tooltip a partir de las filas visibles.
+    fn tooltip(&self) -> String {
+        let view = self.view.borrow();
+        if view.rows.is_empty() {
+            return format!("{} — {}", meta::APP_NAME, strings::EMPTY_TITLE);
+        }
+        let parts: Vec<String> = view
+            .rows
+            .iter()
+            .map(|row| format!("{} {}", row.title, row.value))
+            .collect();
+        let mut tip = format!("{} — {}", meta::APP_NAME, parts.join(" · "));
+        if tip.chars().count() > 120 {
+            tip = tip.chars().take(117).collect::<String>() + "…";
+        }
+        tip
+    }
+
+    /// Notifica una sola vez por clave.
+    fn notify_once(&self, hwnd: HWND, key: &str, title: &str, body: &str) {
+        let announce = match self.notified.try_borrow_mut() {
+            Ok(mut keys) => keys.insert(key.to_string()),
+            Err(_) => false,
+        };
+        if announce {
+            tray::notify(hwnd, title, body, true);
+        }
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Red de seguridad: `WM_DESTROY` ya deja ambos contadores a cero, así que
-        // esto solo actúa si la ventana no llegó a destruirse.
-        for slot in [&self.tray_icon, &self.tray_retired] {
-            let handle = slot.replace(0);
-            if handle != 0 {
-                unsafe {
-                    let _ = DestroyIcon(HICON(handle as *mut c_void));
-                }
+        // Red de seguridad: `WM_DESTROY` ya deja el contador a cero, así que esto
+        // solo actúa si la ventana no llegó a destruirse.
+        let handle = self.tray_icon.replace(0);
+        if handle != 0 {
+            unsafe {
+                let _ = DestroyIcon(HICON(handle as *mut c_void));
             }
         }
     }
@@ -167,16 +166,21 @@ fn destroy_window(hwnd: HWND) -> bool {
             return true;
         }
         if DestroyWindow(hwnd).is_err() {
-            util::log("no se pudo destruir una ventana");
+            meta::log("no se pudo destruir una ventana");
         }
         !IsWindow(hwnd).as_bool()
     }
 }
 
+fn tray_icon(app: &App) -> Option<HICON> {
+    let handle = app.tray_icon.get();
+    (handle != 0).then_some(HICON(handle as *mut c_void))
+}
+
 pub(crate) fn run(args: cli::Args) {
     unsafe {
         let _ = platform::dpi::enable_per_monitor_v2();
-        std::panic::set_hook(Box::new(|info| util::log(&format!("panic: {info}"))));
+        std::panic::set_hook(Box::new(|info| meta::log(&format!("panic: {info}"))));
 
         if args.dump {
             dump();
@@ -191,21 +195,18 @@ pub(crate) fn run(args: cli::Args) {
         let app = Box::new(App::new());
         let app_ptr = NonNull::from(&*app);
         let config = app.config_snapshot();
-        i18n::set_current(config.language());
         app.show_on_first.set(args.show);
-        util::log(&format!(
-            "inicio v{} — idioma {} — refresco {}s — umbral {}%",
+        meta::log(&format!(
+            "inicio v{} — refresco {}s",
             meta::VERSION,
-            i18n::current(),
-            config.refresh_interval_secs(),
-            config.threshold()
+            config.refresh_interval_secs()
         ));
 
         let Some(instance) = GetModuleHandleW(None)
             .ok()
             .map(|module| HINSTANCE(module.0))
         else {
-            util::log("no se pudo obtener el módulo");
+            meta::log("no se pudo obtener el módulo");
             return;
         };
 
@@ -220,7 +221,7 @@ pub(crate) fn run(args: cli::Args) {
             ..Default::default()
         };
         if RegisterClassW(&main_wc) == 0 {
-            util::log("no se pudo registrar la ventana principal");
+            meta::log("no se pudo registrar la ventana principal");
             return;
         }
 
@@ -234,11 +235,11 @@ pub(crate) fn run(args: cli::Args) {
             ..Default::default()
         };
         if RegisterClassW(&panel_wc) == 0 {
-            util::log("no se pudo registrar el panel");
+            meta::log("no se pudo registrar el panel");
             return;
         }
 
-        let window_title = windows::core::HSTRING::from(i18n::text().app);
+        let window_title = windows::core::HSTRING::from(meta::APP_NAME);
         let params = Some(app_ptr.as_ptr() as *const c_void);
         let Ok(hwnd) = CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -254,7 +255,7 @@ pub(crate) fn run(args: cli::Args) {
             instance,
             params,
         ) else {
-            util::log("no se pudo crear la ventana principal");
+            meta::log("no se pudo crear la ventana principal");
             return;
         };
 
@@ -272,16 +273,14 @@ pub(crate) fn run(args: cli::Args) {
             instance,
             params,
         ) else {
-            util::log("no se pudo crear el panel");
+            meta::log("no se pudo crear el panel");
             if !destroy_window(hwnd) {
-                util::log("la ventana principal sigue viva; se conserva el estado");
+                meta::log("la ventana principal sigue viva; se conserva el estado");
                 std::mem::forget(app);
             }
             return;
         };
         app.panel.set(Some(panel));
-
-        register_device_notifications(&app, hwnd);
 
         let corner = 2u32; // DWMWCP_ROUND
         let _ = DwmSetWindowAttribute(
@@ -291,25 +290,26 @@ pub(crate) fn run(args: cli::Args) {
             std::mem::size_of::<u32>() as u32,
         );
 
-        let mut nid = base_nid(hwnd, NIF_MESSAGE | NIF_ICON | NIF_TIP);
-        if let Some(initial) = icon::create(None, false) {
-            nid.hIcon = initial;
-            app.tray_icon.set(initial.0 as isize);
+        let icon = match tray::load_app_icon() {
+            Some(icon) => {
+                app.tray_icon.set(icon.0 as isize);
+                icon
+            }
+            None => {
+                meta::log("no se pudo cargar el icono de la aplicación");
+                HICON::default()
+            }
+        };
+        if !tray::add(hwnd, WM_TRAY, icon, &app.tooltip()) {
+            meta::log("no se pudo crear el icono de la bandeja");
         }
-        set_tip(
-            &mut nid,
-            &format!("{}: {}", i18n::text().app, i18n::text().empty_title),
-        );
-        if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-            util::log("no se pudo crear el icono de la bandeja");
-        }
+
         let _ = SetTimer(
             hwnd,
             TIMER_REFRESH,
             (config.refresh_interval_secs() * 1000) as u32,
             None,
         );
-        let _ = SetTimer(hwnd, TIMER_NOTIFICATIONS, 1000, None);
 
         request_refresh(&app, hwnd, "inicio");
 
@@ -318,7 +318,7 @@ pub(crate) fn run(args: cli::Args) {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
-        util::log("fin");
+        meta::log("fin");
 
         // Ninguna ventana puede sobrevivir al estado: se destruyen antes de liberarlo.
         let panel_gone = destroy_window(panel);
@@ -326,7 +326,7 @@ pub(crate) fn run(args: cli::Args) {
         if panel_gone && main_gone {
             drop(app);
         } else {
-            util::log(
+            meta::log(
                 "queda una ventana sin destruir; se conserva el estado hasta el fin del proceso",
             );
             std::mem::forget(app);
@@ -334,97 +334,41 @@ pub(crate) fn run(args: cli::Args) {
     }
 }
 
-/// Se suscribe a los cambios de interfaces HID y Bluetooth para refrescar
-/// en cuanto se conecta o desconecta un dispositivo.
-unsafe fn register_device_notifications(app: &App, hwnd: HWND) {
-    for (name, guid) in [
-        ("HID", GUID_DEVINTERFACE_HID),
-        ("Bluetooth", GUID_DEVINTERFACE_BLUETOOTH),
-    ] {
-        let filter = DEV_BROADCAST_DEVICEINTERFACE_W {
-            dbcc_size: std::mem::size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32,
-            dbcc_devicetype: DBT_DEVTYP_DEVICEINTERFACE,
-            dbcc_reserved: 0,
-            dbcc_classguid: guid,
-            dbcc_name: [0],
-        };
-        match RegisterDeviceNotificationW(
-            hwnd,
-            &filter as *const _ as *const c_void,
-            DEVICE_NOTIFY_WINDOW_HANDLE,
-        ) {
-            Ok(handle) => {
-                if let Ok(mut list) = app.device_notifications.try_borrow_mut() {
-                    list.push(handle.0 as isize);
-                }
-                util::log(&format!("suscripción a cambios de {name} activa"));
-            }
-            Err(error) => util::log(&format!("no se pudo suscribir a {name}: {error}")),
-        }
-    }
-}
-
-fn base_nid(hwnd: HWND, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
-    NOTIFYICONDATAW {
-        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: hwnd,
-        uID: TRAY_ID,
-        uFlags: flags,
-        uCallbackMessage: WM_TRAY,
-        ..Default::default()
-    }
-}
-
-fn set_tip(nid: &mut NOTIFYICONDATAW, tip: &str) {
-    let wide: Vec<u16> = tip.encode_utf16().take(127).collect();
-    nid.szTip[..wide.len()].copy_from_slice(&wide);
-    for slot in nid.szTip[wide.len()..].iter_mut() {
-        *slot = 0;
-    }
-}
-
-fn build_tip(list: &[DeviceBattery]) -> String {
-    let text = i18n::text();
-    if list.is_empty() {
-        return format!("{} — {}", text.app, text.tip_no_devices);
-    }
-    let mut tip = format!("{} — ", text.app);
-    for (index, device) in list.iter().enumerate() {
-        if index > 0 {
-            tip.push_str(" · ");
-        }
-        let name: String = device.name.chars().take(16).collect();
-        tip.push_str(&format!("{} {}%", name, device.percent));
-        if device.plugged() {
-            tip.push_str(&format!(" ({})", text.tip_charging));
-        }
-    }
-    if tip.chars().count() > 120 {
-        tip = tip.chars().take(117).collect::<String>() + "…";
-    }
-    tip
+/// Datos que muestra la aplicación.
+///
+/// **Este es el punto de extensión de la plantilla**: al crear una aplicación
+/// nueva, sustituye esta función por la que produzca tus filas.
+fn snapshot(_config: &Config) -> Vec<RowView> {
+    let (hours, minutes, _) = time::local_time();
+    vec![RowView {
+        title: strings::ROW_TIME.to_string(),
+        detail: strings::ROW_TIME_DETAIL.to_string(),
+        value: format!("{hours:02}:{minutes:02}"),
+        percent: None,
+        accent: panel::Accent::for_percent(None),
+    }]
 }
 
 fn request_refresh(app: &App, hwnd: HWND, reason: &str) {
     if app.busy.swap(true, Ordering::SeqCst) {
-        app.pending_from_device.set(true);
+        // El trabajador en curso repetirá el refresco al terminar.
+        app.pending_refresh.set(true);
         return;
     }
-    app.last_refresh.set(Some(Instant::now()));
-    util::log(&format!("refresh ({reason})"));
+    meta::log(&format!("refresh ({reason})"));
     let sender = app.refresh_tx.clone();
     let busy = Arc::clone(&app.busy);
     let address = hwnd.0 as isize;
     let config = app.config_snapshot();
     std::thread::spawn(move || {
-        let list = match std::panic::catch_unwind(|| refresh_all(&config)) {
-            Ok(list) => list,
+        let rows = match std::panic::catch_unwind(|| snapshot(&config)) {
+            Ok(rows) => rows,
             Err(_) => {
-                util::log("refresh: error inesperado");
+                meta::log("refresh: error inesperado");
                 Vec::new()
             }
         };
-        let _ = sender.send(list);
+        let _ = sender.send(rows);
         busy.store(false, Ordering::SeqCst);
         unsafe {
             let _ = PostMessageW(
@@ -439,60 +383,32 @@ fn request_refresh(app: &App, hwnd: HWND, reason: &str) {
 
 unsafe fn on_refreshed(app: &App, hwnd: HWND) {
     let mut received = Vec::new();
-    while let Ok(list) = app.refresh_rx.try_recv() {
-        received = list;
+    while let Ok(rows) = app.refresh_rx.try_recv() {
+        received = rows;
     }
 
-    let show_time_remaining = app.config_snapshot().show_time_remaining;
-    if let Ok(mut history) = app.history.try_borrow_mut() {
-        let now = history::unix_now();
-        for device in received.iter_mut() {
-            history.record(&device.key, device.percent, now);
-        }
-        for device in received.iter_mut() {
-            if !device.plugged() && show_time_remaining {
-                device.time_left = history.estimate(&device.key, device.percent, now);
-            }
-        }
-        history.save();
-    }
-
-    let changed = match app.devices.try_borrow() {
-        Ok(previous) => {
-            previous.len() != received.len()
-                || previous.iter().zip(received.iter()).any(|(old, new)| {
-                    old.name != new.name
-                        || old.percent != new.percent
-                        || old.source != new.source
-                        || old.charge != new.charge
-                })
-        }
+    let changed = match app.view.try_borrow() {
+        Ok(view) => view.rows != received,
         Err(_) => true,
     };
-    if let Ok(mut devices) = app.devices.try_borrow_mut() {
-        *devices = received.clone();
+    if let Ok(mut view) = app.view.try_borrow_mut() {
+        view.rows = received.clone();
+        let (hours, minutes, _) = time::local_time();
+        view.subtitle = Some(format!("{} {hours:02}:{minutes:02}", strings::UPDATED));
     }
-    if changed {
-        for device in &received {
-            let charge = match device.charge {
-                Some(state) => format!(" · {}", i18n::text().charge(state)),
-                None => String::new(),
-            };
-            util::log(&format!(
-                "{} = {}% ({} · {}{charge})",
-                device.name,
-                device.percent,
-                i18n::text().kind(device.kind),
-                device.source
-            ));
-        }
-        util::log(&format!("refresh: {} dispositivo(s)", received.len()));
-    }
-    let (hours, minutes, _) = util::local_time();
-    app.updated.set(Some((hours, minutes)));
 
-    update_tray(app, hwnd, &received);
-    maybe_notify(app, hwnd, &received);
+    if changed {
+        for row in &received {
+            meta::log(&format!("{} = {} ({})", row.title, row.value, row.detail));
+        }
+        meta::log(&format!("refresh: {} fila(s)", received.len()));
+    }
+
+    if let Some(icon) = tray_icon(app)
+        && !tray::update(hwnd, icon, &app.tooltip())
+    {
+        meta::log("no se pudo actualizar la bandeja");
+    }
 
     if app.show_on_first.replace(false) {
         show_panel(app);
@@ -504,167 +420,75 @@ unsafe fn on_refreshed(app: &App, hwnd: HWND) {
     }
 }
 
-unsafe fn update_tray(app: &App, hwnd: HWND, list: &[DeviceBattery]) {
-    let minimum = list.iter().map(|device| device.percent).min();
-    let charging = list.iter().any(DeviceBattery::plugged);
-
-    let state = (minimum, charging);
-    let changed = if app.tray_state.get() == Some(state) {
-        false
-    } else {
-        app.tray_state.set(Some(state));
-        true
-    };
-    if changed {
-        util::log(&format!("bandeja: nivel={:?} cargando={charging}", minimum));
-    }
-
-    let Some(new_icon) = icon::create(minimum, charging) else {
-        return;
-    };
-    let mut nid = base_nid(hwnd, NIF_MESSAGE | NIF_ICON | NIF_TIP);
-    nid.hIcon = new_icon;
-    set_tip(&mut nid, &build_tip(list));
-    if Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
-        let previous = app.tray_icon.replace(new_icon.0 as isize);
-        // El icono anterior se libera en la siguiente actualización: el shell
-        // necesita tiempo para copiarlo y, si se destruye antes, sigue
-        // mostrando el antiguo.
-        let older = app.tray_retired.replace(previous);
-        if older != 0 {
-            let _ = DestroyIcon(HICON(older as *mut c_void));
-        }
-    } else {
-        let _ = DestroyIcon(new_icon);
-    }
-}
-
-unsafe fn maybe_notify(app: &App, hwnd: HWND, list: &[DeviceBattery]) {
-    let threshold = app.config_snapshot().threshold();
-    let low = list
-        .iter()
-        .filter(|device| device.percent <= threshold && !device.plugged())
-        .min_by_key(|device| device.percent);
-
-    if let Some(device) = low {
-        // El préstamo se cierra antes de hablar con el shell: es una llamada
-        // externa y no debe coincidir con un `borrow` activo.
-        let announce = match app.notified.try_borrow_mut() {
-            Ok(mut alert) => alert.insert(device.key.clone()),
-            Err(_) => false,
-        };
-        if announce {
-            let text = i18n::text();
-            let mut nid = base_nid(hwnd, NIF_INFO);
-            let title: Vec<u16> = text.low_title.encode_utf16().collect();
-            let body: Vec<u16> = text
-                .low_body(&device.name, device.percent)
-                .encode_utf16()
-                .collect();
-            nid.szInfoTitle[..title.len()].copy_from_slice(&title);
-            nid.szInfo[..body.len()].copy_from_slice(&body);
-            nid.dwInfoFlags = NIIF_WARNING;
-            nid.Anonymous.uTimeout = 6000;
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-        }
-    }
-
-    if let Ok(mut alert) = app.notified.try_borrow_mut() {
-        alert.retain(|key| {
-            list.iter().any(|device| {
-                &device.key == key
-                    && device.percent <= threshold.saturating_add(5)
-                    && !device.plugged()
-            })
-        });
-    }
-}
-
 fn show_panel(app: &App) {
     let Some(panel) = app.panel.get() else {
         return;
     };
-    let count = app.devices.borrow().len();
+    let count = app.view.borrow().rows.len();
     unsafe {
         panel::show(panel, count);
     }
 }
 
 unsafe fn show_menu(app: &App, hwnd: HWND) {
-    let text = i18n::text();
-    let Ok(menu) = CreatePopupMenu() else {
-        return;
-    };
-    let _ = AppendMenuW(
-        menu,
-        MF_STRING,
-        ID_PANEL,
-        &windows::core::HSTRING::from(text.menu_show),
-    );
-    let _ = AppendMenuW(
-        menu,
-        MF_STRING,
-        ID_REFRESH,
-        &windows::core::HSTRING::from(text.menu_refresh),
-    );
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let flags = if platform::registry::autostart_enabled(meta::RUN_VALUE) {
-        MF_STRING | MF_CHECKED
-    } else {
-        MF_STRING | MF_UNCHECKED
-    };
-    let _ = AppendMenuW(
-        menu,
-        flags,
-        ID_AUTOSTART,
-        &windows::core::HSTRING::from(text.menu_autostart),
-    );
-    let _ = AppendMenuW(
-        menu,
-        MF_STRING,
-        ID_CONFIG,
-        &windows::core::HSTRING::from(text.menu_config),
-    );
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(
-        menu,
-        MF_STRING,
-        ID_EXIT,
-        &windows::core::HSTRING::from(text.menu_exit),
-    );
+    let autostart = platform::registry::autostart_enabled(meta::RUN_VALUE);
+    let items = [
+        tray::MenuItem::Item {
+            id: ID_PANEL,
+            label: strings::MENU_SHOW,
+            checked: false,
+        },
+        tray::MenuItem::Item {
+            id: ID_REFRESH,
+            label: strings::MENU_REFRESH,
+            checked: false,
+        },
+        tray::MenuItem::Item {
+            id: ID_TEST_NOTIFICATION,
+            label: strings::MENU_TEST_NOTIFICATION,
+            checked: false,
+        },
+        tray::MenuItem::Separator,
+        tray::MenuItem::Item {
+            id: ID_AUTOSTART,
+            label: strings::MENU_AUTOSTART,
+            checked: autostart,
+        },
+        tray::MenuItem::Item {
+            id: ID_CONFIG,
+            label: strings::MENU_CONFIG,
+            checked: false,
+        },
+        tray::MenuItem::Separator,
+        tray::MenuItem::Item {
+            id: ID_EXIT,
+            label: strings::MENU_EXIT,
+            checked: false,
+        },
+    ];
 
-    let mut point = POINT::default();
-    let _ = GetCursorPos(&mut point);
-    let _ = SetForegroundWindow(hwnd);
-    let command = TrackPopupMenu(
-        menu,
-        TPM_RETURNCMD | TPM_RIGHTBUTTON,
-        point.x,
-        point.y,
-        0,
-        hwnd,
-        None,
-    );
-    let _ = DestroyMenu(menu);
-    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-
-    match command.0 as usize {
-        ID_REFRESH => request_refresh(app, hwnd, "menú"),
-        ID_PANEL => show_panel(app),
-        ID_AUTOSTART => {
-            let enabled = platform::registry::autostart_enabled(meta::RUN_VALUE);
-            let ok = platform::registry::set_autostart(meta::RUN_VALUE, !enabled);
-            util::log(&format!("inicio con Windows -> {ok}"));
+    match tray::menu(hwnd, &items) {
+        Some(ID_REFRESH) => request_refresh(app, hwnd, "menú"),
+        Some(ID_PANEL) => show_panel(app),
+        Some(ID_TEST_NOTIFICATION) => {
+            let seq = app.notify_seq.get();
+            app.notify_seq.set(seq + 1);
+            let key = format!("test:{seq}");
+            app.notify_once(hwnd, &key, strings::NOTIFY_TITLE, strings::NOTIFY_TEST_BODY);
         }
-        ID_CONFIG => {
+        Some(ID_AUTOSTART) => {
+            let ok = platform::registry::set_autostart(meta::RUN_VALUE, !autostart);
+            meta::log(&format!("inicio con Windows -> {ok}"));
+        }
+        Some(ID_CONFIG) => {
             if let Some(updated) = settings::open(hwnd, app.config_snapshot()) {
                 apply_config(app, hwnd, updated);
             }
         }
-        ID_EXIT => {
+        Some(ID_EXIT) => {
             let closed = DestroyWindow(hwnd);
             if closed.is_err() {
-                util::log("no se pudo cerrar la ventana principal");
+                meta::log("no se pudo cerrar la ventana principal");
             }
         }
         _ => {}
@@ -676,19 +500,13 @@ unsafe fn apply_config(app: &App, hwnd: HWND, updated: Config) {
     if let Ok(mut config) = app.config.try_borrow_mut() {
         *config = updated.clone();
     }
-    i18n::set_current(updated.language());
 
-    let title = windows::core::HSTRING::from(i18n::text().app);
+    let title = windows::core::HSTRING::from(meta::APP_NAME);
     let _ = SetWindowTextW(hwnd, &title);
     if let Some(panel) = app.panel.get() {
         let _ = SetWindowTextW(panel, &title);
         let _ = windows::Win32::Graphics::Gdi::InvalidateRect(panel, None, true);
     }
-
-    // El tooltip está en otro idioma y el umbral puede haber cambiado.
-    app.tray_state.set(None);
-    let list = app.devices_snapshot();
-    update_tray(app, hwnd, &list);
 
     let _ = SetTimer(
         hwnd,
@@ -696,11 +514,9 @@ unsafe fn apply_config(app: &App, hwnd: HWND, updated: Config) {
         (updated.refresh_interval_secs() * 1000) as u32,
         None,
     );
-    util::log(&format!(
-        "configuración aplicada — idioma {} — refresco {}s — umbral {}%",
-        i18n::current(),
-        updated.refresh_interval_secs(),
-        updated.threshold()
+    meta::log(&format!(
+        "configuración aplicada — refresco {}s",
+        updated.refresh_interval_secs()
     ));
     request_refresh(app, hwnd, "configuración");
 }
@@ -710,7 +526,7 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         if msg == WM_NCCREATE {
             // Sin estado asociado no se admite la ventana.
             if !attach_app(hwnd, lparam) {
-                util::log("no se pudo asociar el estado a la ventana principal");
+                meta::log("no se pudo asociar el estado a la ventana principal");
                 return LRESULT(0);
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -750,75 +566,26 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             }
             WM_REFRESHED => {
                 on_refreshed(app, hwnd);
-                if app.pending_from_device.replace(false) {
+                if app.pending_refresh.replace(false) {
                     request_refresh(app, hwnd, "pendiente");
                 }
                 LRESULT(0)
             }
             WM_TIMER => {
-                match wparam.0 {
-                    TIMER_REFRESH => request_refresh(app, hwnd, "temporizador"),
-                    TIMER_NOTIFICATIONS => {
-                        if battery::hidpp::take_notification() {
-                            let recent = app
-                                .last_refresh
-                                .get()
-                                .map(|when| when.elapsed().as_millis() < MIN_REFRESH_GAP_MS)
-                                .unwrap_or(false);
-                            if recent {
-                                app.pending_from_device.set(true);
-                            } else {
-                                request_refresh(app, hwnd, "notificación");
-                            }
-                        }
-                    }
-                    TIMER_DEVICES => {
-                        let _ = KillTimer(hwnd, TIMER_DEVICES);
-                        // Puede haber cambiado el índice del dispositivo en el receptor.
-                        battery::hidpp::force_full_scan();
-                        request_refresh(app, hwnd, "cambio de dispositivos");
-                    }
-                    _ => {}
-                }
-                LRESULT(0)
-            }
-            WM_DEVICECHANGE => {
-                let event = wparam.0 as u32;
-                let device_interface = lparam.0 == 0 || {
-                    // DEV_BROADCAST_HDR: tamaño (u32) y tipo (u32).
-                    let header = lparam.0 as *const u32;
-                    header.add(1).read_unaligned() == DBT_DEVTYP_DEVICEINTERFACE
-                };
-                if device_interface
-                    && (event == DBT_DEVNODES_CHANGED
-                        || event == DBT_DEVICEARRIVAL
-                        || event == DBT_DEVICEREMOVECOMPLETE)
-                {
-                    // Se agrupan ráfagas de eventos en un único refresco diferido.
-                    let _ = SetTimer(hwnd, TIMER_DEVICES, 1200, None);
+                if wparam.0 == TIMER_REFRESH {
+                    request_refresh(app, hwnd, "temporizador");
                 }
                 LRESULT(0)
             }
             WM_DESTROY => {
-                let handles: Vec<isize> = match app.device_notifications.try_borrow_mut() {
-                    Ok(mut list) => list.drain(..).collect(),
-                    Err(_) => Vec::new(),
-                };
-                for handle in handles {
-                    let _ = UnregisterDeviceNotification(HDEVNOTIFY(handle as *mut c_void));
+                if !tray::remove(hwnd) {
+                    meta::log("no se pudo quitar el icono de la bandeja");
                 }
-                for slot in [&app.tray_icon, &app.tray_retired] {
-                    let handle = slot.replace(0);
-                    if handle != 0 {
-                        let _ = DestroyIcon(HICON(handle as *mut c_void));
-                    }
-                }
-                let nid = base_nid(hwnd, NIF_MESSAGE);
-                if !Shell_NotifyIconW(NIM_DELETE, &nid).as_bool() {
-                    util::log("no se pudo quitar el icono de la bandeja");
+                let handle = app.tray_icon.replace(0);
+                if handle != 0 {
+                    let _ = DestroyIcon(HICON(handle as *mut c_void));
                 }
                 let _ = KillTimer(hwnd, TIMER_REFRESH);
-                let _ = KillTimer(hwnd, TIMER_NOTIFICATIONS);
                 if let Some(panel) = app.panel.get() {
                     let _ = destroy_window(panel);
                 }
@@ -834,7 +601,7 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
     unsafe {
         if msg == WM_NCCREATE {
             if !attach_app(hwnd, lparam) {
-                util::log("no se pudo asociar el estado al panel");
+                meta::log("no se pudo asociar el estado al panel");
                 return LRESULT(0);
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -851,17 +618,15 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 
         match msg {
             WM_PAINT => {
-                let list = app.devices_snapshot();
-                let timestamp = app.updated.get();
-                panel::paint(hwnd, &list, timestamp);
+                let view = app.view.borrow().clone();
+                panel::paint(hwnd, &view);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_PRINTCLIENT => {
-                let list = app.devices_snapshot();
-                let timestamp = app.updated.get();
+                let view = app.view.borrow().clone();
                 let dc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
-                panel::paint_to(hwnd, dc, &list, timestamp);
+                panel::paint_to(hwnd, dc, &view);
                 LRESULT(0)
             }
             WM_ACTIVATE => {
@@ -887,44 +652,28 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 
 fn dump() {
     let config = Config::load();
-    i18n::set_current(config.language());
-    let list = refresh_all(&config);
-    platform::console::print_line(&to_json(&list));
+    let rows = snapshot(&config);
+    platform::console::print_line(&to_json(&rows));
 }
 
-fn to_json(list: &[DeviceBattery]) -> String {
-    if list.is_empty() {
+fn to_json(rows: &[RowView]) -> String {
+    if rows.is_empty() {
         return "[\n]".to_string();
     }
     let mut out = String::from("[\n");
-    for (index, device) in list.iter().enumerate() {
+    for (index, row) in rows.iter().enumerate() {
         if index > 0 {
             out.push_str(",\n");
         }
         out.push_str("  {");
-        out.push_str(&format!("\"name\":{},", quote(&device.name)));
-        out.push_str(&format!("\"kind\":{},", quote(device.kind.slug())));
-        out.push_str(&format!("\"percent\":{},", device.percent));
-        out.push_str(&format!("\"approx\":{},", device.approx));
-        out.push_str(&format!("\"charging\":{},", device.plugged()));
-        out.push_str(&format!("\"wired\":{},", device.wired));
-        let charge = match device.charge {
-            Some(ChargeState::Charging) => Some("charging"),
-            Some(ChargeState::Finishing) => Some("finishing"),
-            Some(ChargeState::Full) => Some("full"),
-            None => None,
-        };
-        out.push_str(&format!(
-            "\"charge\":{},",
-            charge.map(quote).unwrap_or_else(|| "null".to_string())
-        ));
-        out.push_str(&format!("\"source\":{},", quote(&device.source)));
-        out.push_str(&format!("\"key\":{},", quote(&device.key)));
-        let seconds = device
-            .time_left
-            .map(|left| left.as_secs().to_string())
+        out.push_str(&format!("\"title\":{},", quote(&row.title)));
+        out.push_str(&format!("\"detail\":{},", quote(&row.detail)));
+        out.push_str(&format!("\"value\":{},", quote(&row.value)));
+        let percent = row
+            .percent
+            .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_string());
-        out.push_str(&format!("\"time_left_seconds\":{seconds}"));
+        out.push_str(&format!("\"percent\":{percent}"));
         out.push('}');
     }
     out.push_str("\n]");
@@ -952,19 +701,14 @@ fn quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::battery::DeviceKind;
 
-    fn sample() -> DeviceBattery {
-        DeviceBattery {
-            name: "MX \"Keys\"\tS".to_string(),
-            kind: DeviceKind::Keyboard,
-            percent: 90,
-            approx: false,
-            charge: Some(ChargeState::Charging),
-            wired: false,
-            source: "Receptor Bolt".to_string(),
-            key: "hidpp:046d:2".to_string(),
-            time_left: None,
+    fn sample() -> RowView {
+        RowView {
+            title: "Hora \"local\"\tX".to_string(),
+            detail: "Detalle".to_string(),
+            value: "18:05".to_string(),
+            percent: Some(62),
+            accent: panel::Accent::Warn,
         }
     }
 
@@ -980,13 +724,17 @@ mod tests {
     fn json_contains_expected_fields() {
         let json = to_json(&[sample()]);
         assert!(json.starts_with("[\n  {"));
-        assert!(json.contains("\"kind\":\"keyboard\""));
-        assert!(json.contains("\"percent\":90"));
-        assert!(json.contains("\"charging\":true"));
-        assert!(json.contains("\"wired\":false"));
-        assert!(json.contains("\"charge\":\"charging\""));
-        assert!(json.contains("\"time_left_seconds\":null"));
+        assert!(json.contains("\"title\":\"Hora \\\"local\\\"\\tX\""));
+        assert!(json.contains("\"value\":\"18:05\""));
+        assert!(json.contains("\"percent\":62"));
         assert!(json.ends_with("\n]"));
+    }
+
+    #[test]
+    fn json_serializes_missing_percent_as_null() {
+        let mut row = sample();
+        row.percent = None;
+        assert!(to_json(&[row]).contains("\"percent\":null"));
     }
 
     #[test]
