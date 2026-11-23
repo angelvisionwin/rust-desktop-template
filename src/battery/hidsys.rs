@@ -148,7 +148,7 @@ unsafe fn enumerate_inner(set: HDEVINFO, out: &mut Vec<HidDevice>) {
         )
         .as_bool()
         {
-            product = crate::util::from_wide(&name_buf);
+            product = crate::platform::string::from_wide(&name_buf);
         }
 
         out.push(HidDevice {

@@ -146,10 +146,7 @@ fn escape(value: &str) -> String {
 }
 
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join(meta::DATA_DIR_NAME)
+    crate::platform::paths::data_dir(meta::DATA_DIR_NAME)
 }
 
 pub fn path() -> PathBuf {

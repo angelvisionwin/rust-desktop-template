@@ -8,6 +8,7 @@ mod i18n;
 mod icon;
 mod meta;
 mod panel;
+mod platform;
 mod settings;
 mod util;
 
@@ -20,18 +21,9 @@ use std::time::Instant;
 use battery::{ChargeState, DeviceBattery, refresh_all};
 use config::Config;
 use history::History;
-use windows::Win32::Foundation::{
-    BOOL, ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
-};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
-use windows::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -126,11 +118,11 @@ fn history() -> &'static Mutex<History> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
-        print_line(&format!("{} {}", meta::BIN_NAME, meta::VERSION));
+        platform::console::print_line(&format!("{} {}", meta::BIN_NAME, meta::VERSION));
         return;
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print_line(&format!(
+        platform::console::print_line(&format!(
             "Uso: {} [--show] [--dump] [--version]\n  \
              --show     abre el panel al arrancar\n  \
              --dump     imprime el estado en JSON y termina\n  \
@@ -141,7 +133,7 @@ fn main() {
     }
 
     unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let _ = platform::dpi::enable_per_monitor_v2();
         std::panic::set_hook(Box::new(|info| util::log(&format!("panic: {info}"))));
 
         if args.iter().any(|arg| arg == "--dump") {
@@ -149,7 +141,7 @@ fn main() {
             return;
         }
 
-        if !single_instance() {
+        if !platform::instance::acquire(meta::MUTEX_NAME) {
             return;
         }
         i18n::set_current(config().language());
@@ -303,14 +295,6 @@ unsafe fn register_device_notifications(hwnd: HWND) {
             }
             Err(error) => util::log(&format!("no se pudo suscribir a {name}: {error}")),
         }
-    }
-}
-
-unsafe fn single_instance() -> bool {
-    match CreateMutexW(None, BOOL(1), meta::MUTEX_NAME) {
-        // El handle permanece abierto hasta que termina el proceso.
-        Ok(_handle) => GetLastError() != ERROR_ALREADY_EXISTS,
-        Err(_) => false,
     }
 }
 
@@ -553,7 +537,7 @@ unsafe fn show_menu(hwnd: HWND) {
         &windows::core::HSTRING::from(text.menu_refresh),
     );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let flags = if util::autostart_enabled() {
+    let flags = if platform::registry::autostart_enabled(meta::RUN_VALUE) {
         MF_STRING | MF_CHECKED
     } else {
         MF_STRING | MF_UNCHECKED
@@ -597,8 +581,8 @@ unsafe fn show_menu(hwnd: HWND) {
         ID_REFRESH => request_refresh(hwnd, "menú"),
         ID_PANEL => show_panel(),
         ID_AUTOSTART => {
-            let enabled = util::autostart_enabled();
-            let ok = util::set_autostart(!enabled);
+            let enabled = platform::registry::autostart_enabled(meta::RUN_VALUE);
+            let ok = platform::registry::set_autostart(meta::RUN_VALUE, !enabled);
             util::log(&format!("inicio con Windows -> {ok}"));
         }
         ID_CONFIG => {
@@ -782,38 +766,10 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 
 // --------------------------- modo consola ---------------------------
 
-fn print_line(text: &str) {
-    let mut payload = text.to_string();
-    payload.push_str("\r\n");
-    unsafe {
-        // Si la salida está redirigida se usa el handle heredado; si no,
-        // se engancha a la consola del proceso padre (cmd/PowerShell).
-        let mut handle = GetStdHandle(STD_OUTPUT_HANDLE).ok();
-        if handle.map(|h| h.is_invalid()).unwrap_or(true) {
-            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-            handle = GetStdHandle(STD_OUTPUT_HANDLE).ok();
-        }
-        let Some(handle) = handle else {
-            return;
-        };
-        if handle.is_invalid() {
-            return;
-        }
-        let bytes = payload.as_bytes();
-        let mut written = 0u32;
-        let _ = windows::Win32::Storage::FileSystem::WriteFile(
-            handle,
-            Some(bytes),
-            Some(&mut written),
-            None,
-        );
-    }
-}
-
 fn dump() {
     i18n::set_current(config().language());
     let list = refresh_all(&config());
-    print_line(&to_json(&list));
+    platform::console::print_line(&to_json(&list));
 }
 
 fn to_json(list: &[DeviceBattery]) -> String {

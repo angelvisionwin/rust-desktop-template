@@ -175,7 +175,14 @@ src/
 ├─ i18n.rs              Traducciones (es, ca, en, fr, de)
 ├─ config.rs            Lectura y escritura de config.toml
 ├─ history.rs           Histórico y estimación del tiempo restante
-├─ util.rs              Registro de Windows, tema, idioma del sistema y log
+├─ util.rs              Log rotativo, idioma del sistema y hora local
+├─ platform/            Capa Win32 reutilizable, sin lógica de la aplicación
+│  ├─ paths.rs          Rutas del sistema y directorio de datos
+│  ├─ registry.rs       Inicio automático y tema claro/oscuro
+│  ├─ instance.rs       Instancia única (mutex con nombre)
+│  ├─ console.rs        Salida por consola desde un ejecutable gráfico
+│  ├─ dpi.rs            Conciencia de DPI del proceso
+│  └─ string.rs         Conversión UTF-16
 └─ battery/
    ├─ mod.rs            Modelo de datos y agregación de fuentes
    ├─ hidpp.rs          Protocolo Logitech HID++ 2.0 (sesión y notificaciones)

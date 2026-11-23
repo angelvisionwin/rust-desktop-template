@@ -30,6 +30,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 use crate::config::Config;
 use crate::i18n::{self, Lang};
 use crate::meta;
+use crate::platform::string;
 use crate::util;
 
 const ID_LANGUAGE: i32 = 101;
@@ -603,7 +604,7 @@ fn rect(x: i32, y: i32, width: i32, height: i32) -> RECT {
 }
 
 unsafe fn add_combo_item(combo: HWND, text: &str) {
-    let wide = util::wide(text);
+    let wide = string::wide(text);
     SendMessageW(
         combo,
         CB_ADDSTRING,

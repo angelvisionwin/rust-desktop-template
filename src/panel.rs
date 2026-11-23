@@ -19,7 +19,7 @@ use windows::core::w;
 
 use crate::battery::{DeviceBattery, DeviceKind};
 use crate::i18n;
-use crate::util;
+use crate::platform::registry;
 
 const HEADER: f32 = 54.0;
 const ROW: f32 = 62.0;
@@ -169,7 +169,7 @@ unsafe fn render(hwnd: HWND, hdc: HDC, devices: &[DeviceBattery], updated: Optio
 
     let old_bitmap = SelectObject(memory, HGDIOBJ(bitmap.0));
 
-    let colors = theme(util::is_dark_mode());
+    let colors = theme(registry::is_dark_mode());
     let text_strings = i18n::text();
     let dpi = {
         let dpi = GetDpiForWindow(hwnd);
