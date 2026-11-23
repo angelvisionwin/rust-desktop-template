@@ -396,7 +396,7 @@ pub unsafe fn open(parent: HWND) -> Option<Config> {
         return None;
     };
 
-    let current = crate::config();
+    let current = crate::app::config();
     let mut result: Option<Config> = None;
     let state = Box::into_raw(Box::new(State {
         parent,

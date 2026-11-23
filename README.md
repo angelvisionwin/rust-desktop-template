@@ -167,7 +167,10 @@ No se envía nada a la red y no se recopilan datos personales.
 
 ```
 src/
-├─ main.rs              Ventana, bandeja, menú, temporizadores, CLI y notificaciones
+├─ main.rs              Punto de entrada del ejecutable
+├─ lib.rs               Raíz de la biblioteca y declaración de módulos
+├─ cli.rs               Argumentos, ayuda y versión
+├─ app.rs               Ventana, bandeja, menú, temporizadores y notificaciones
 ├─ meta.rs              Identidad de la aplicación (clases, mutex, rutas, versión)
 ├─ panel.rs             Panel dibujado con GDI (tema claro/oscuro, barras e iconos)
 ├─ settings.rs          Diálogo de configuración (idioma, umbral, intervalo, dispositivos)
